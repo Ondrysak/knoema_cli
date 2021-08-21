@@ -4,12 +4,111 @@ import pandas as pd
 import pycountry
 import click
 import logging
+from itertools import zip_longest
 from typing import List, Dict, Any, Union
 
 API_BASE = 'http://knoema.com/api/1.0'
 SIMPLE_API_URL = f'{API_BASE}/data/get'
+RAW_API_URL = f'{API_BASE}/data/details'
 
 logging.basicConfig(level=logging.DEBUG)
+
+
+def grouper(iterable, n, fillvalue=None):
+    '''
+    Collect data into fixed-length chunks or blocks
+
+    grouper('ABCDEFG', 3, 'x') --> ABC DEF Gxx"
+
+    :param iterable: iterable we want to group
+    :param n:  size of chunks
+    :param fillvalue: fill value in case the iterable length is not divisible by chunk size
+    :return: grouped values
+    '''
+    args = [iter(iterable)] * n
+    return zip_longest(*args, fillvalue=fillvalue)
+
+
+
+def create_raw_request(dataset_id: str, frequencies: List[str], dim_filter: List[Dict]):
+    '''
+    Create raw request payload.
+
+    :param dataset_id: name identifying the dataset
+    :param frequencies: list of included frequencies
+    :param dim_filter: dimension filter
+    :return: deserialized JSON object
+    '''
+
+    logging.debug('Creating new raw request payload')
+    payload = {'Filter': dim_filter, 'Frequencies': frequencies, 'Dataset': dataset_id}
+    logging.debug(f'Created payload {payload}')
+    return payload
+
+
+def add_filters(dimension_id: str, members: List, dimension_name: str, dim_filter: List = []):
+    '''
+    Function to create or modify a list of filters.
+    :param dimension_id: Id of the dimension we want to filter on
+    :param members: List of members we want to include
+    :param dimension_name: Name of the dimension we want to filter on.
+    :param dim_filter: List of previous filters we want to modify if left empty new one is created.
+    :return: Updated list of filters
+    '''
+    logging.debug(f'Filter added')
+    dim_filter.append({"DimensionId": dimension_id, 'Members': members, 'DimensionName': dimension_name})
+    return dim_filter
+
+
+def transform_to_df_raw(input_ts, input_metadata,input_region, response_extract_country, frequency):
+    '''
+    Transform raw data API response with other metadata into a pandas dataframe.
+    :param input_ts: raw data API response
+    :param input_metadata: metadata API response
+    :param input_region: region API response
+    :param response_extract_country: country extraction
+    :param frequency:
+    :return:
+    '''
+    logging.debug('Creating pandas dataframe from raw data api response.')
+    columns = []
+
+    for c in input_ts['columns']:
+        if c['name'] and c['name'] not in columns:
+            columns.append(c['name'])
+        elif c['dimensionId'] and c['dimensionId'] not in columns:
+            columns.append(c['dimensionId'])
+    logging.debug(f'Column names {columns}')
+    if input_region:
+        geo_dimension_id = input_region['geoDimensionId']
+        logging.info(f'GeodimensionId found: {geo_dimension_id}')
+        columns = ["area" if c == geo_dimension_id else c for c in columns]
+    # the datapoints form one huge list, so we have to group them into individual datapoints
+    grouped_list = list(grouper(input_ts['data'], len(columns)))
+    df = pd.DataFrame(grouped_list, columns=columns)
+    df['Date'] = pd.json_normalize(data=df['Date'])
+    # TODO other frequencies exist
+    if frequency == 'M':
+        df['startDate'] = pd.to_datetime(df['Date']) - pd.offsets.MonthBegin(0)
+        df['endDate'] = pd.to_datetime(df['Date']) + pd.offsets.MonthEnd(1)
+    if frequency == 'A':
+        df['startDate'] = pd.to_datetime(df['Date']) - pd.offsets.YearBegin(0)
+        df['endDate'] = pd.to_datetime(df['Date']) + pd.offsets.YearEnd(1)
+    # TODO this is not the actual name
+
+    if input_metadata['name']:
+        logging.debug(f'Setting timeseries name to name from metadata {input_metadata["name"]}')
+        df['seriesName'] = input_metadata['name']
+    else:
+        logging.debug(f'Setting timeseries name to name of dataset {input_ts["datasetName"]}')
+        df['seriesName'] = input_ts['datasetName']
+    if not input_region and response_extract_country:
+        df['area'] = response_extract_country
+    elif not input_region:
+        df['area'] = 'Unknown'
+
+    df = df.drop(['Date'], axis=1)
+    return df
 
 
 def regions_request(dataset_name: str) -> Union[None, bool, int, float, str, List[Any], Dict[str, Any]]:
@@ -95,7 +194,6 @@ def post_request(payload: str, url: str) -> Union[None, bool, int, float, str, L
 
         # If the response was successful, no Exception will be raised
         response.raise_for_status()
-        # print(response.text)
         jsonResponse = response.json()
         return jsonResponse
     except HTTPError as http_err:
@@ -177,6 +275,12 @@ def transform_to_df(input_ts: Dict, input_metadata: Dict , input_region: Dict, e
 
 
 def dataset_region(dataset_name: str) -> Dict:
+    '''
+    Get dataset region metadata
+
+    :param dataset_name: Name identifying the dataset
+    :return:
+    '''
     try:
         region_response = regions_request(dataset_name)[0]
     except TypeError:
@@ -214,6 +318,9 @@ def knoema_cli() -> None:
 )
 @knoema_cli.command()
 def simple(dataset: str, guess_country: bool, timeseries_key: int, csv_file: str) -> None:
+    '''
+    Subcommand for using the simple data API.
+    '''
     metadata_response = ts_metadata(dataset)
     region_response = dataset_region(dataset)
     if guess_country:
@@ -225,6 +332,55 @@ def simple(dataset: str, guess_country: bool, timeseries_key: int, csv_file: str
     logging.info(f'Succesfully created the pandas dataframe')
     output_dataframe.to_csv(csv_file, index=False)
     logging.info(f'Dumped the dataframe to a csv file: {csv_file}')
+
+@knoema_cli.command()
+@click.option(
+    "--dataset",
+    prompt=True,
+    help="Name of the dataset",
+)
+@click.option(
+    "--guess-country/--no-guess-country",
+    default=True,
+    help="Use --no-guess-country if you do not want to try to guess the missing area data from the dataset details.",
+)
+@click.option(
+    "--csv-file",
+    required=True,
+    help="Name of the output csv file",
+    type=str
+)
+@click.option('--frequency', type=click.Choice(['A', 'M']), required=True, help='A= Annual; M=Monthly;')
+@click.option('--filter', '-f', multiple=True, type=str, help='<dimension_id>;<dimension_name>;<member>')
+def raw(dataset, guess_country, csv_file, frequency, filter):
+    '''
+    Subcommand for using the raw data API.
+    '''
+    dim_filter = None
+    logging.debug('Parsing the filters')
+    for f in filter:
+        dimension_id, dimension_name, member = f.split(';')
+        logging.info(f'{dimension_id}, {dimension_name}, {member}')
+        if not dim_filter:
+            dim_filter = add_filters(dimension_id=dimension_id, members=[member], dimension_name=dimension_name)
+        else:
+
+            dim_filter = add_filters(dimension_id=dimension_id, members=[member], dimension_name=dimension_name,
+                                     dim_filter=dim_filter)
+    metadata_response = ts_metadata(dataset)
+    region_response = dataset_region(dataset)
+    if guess_country:
+        extract_country_result = extract_country_name(metadata_response['name'])
+    else:
+        extract_country_result = None
+    raw_data_response = post_request(create_raw_request(dataset, frequencies=[frequency], dim_filter=dim_filter),
+                                RAW_API_URL)
+
+    df = transform_to_df_raw(raw_data_response, metadata_response,region_response, extract_country_result, frequency)
+    logging.info(f'Succesfully created the pandas dataframe')
+    df.to_csv(csv_file, index=False)
+    logging.info(f'Dumped the dataframe to a csv file: {csv_file}')
+
 
 
 if __name__ == "__main__":
